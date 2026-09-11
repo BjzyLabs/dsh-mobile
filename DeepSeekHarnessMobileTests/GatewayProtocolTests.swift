@@ -1712,6 +1712,157 @@ final class GatewayProtocolTests: XCTestCase {
         XCTAssertFalse(store.historyLoadingSessionIds.contains(session.id))
     }
 
+    /// The defect this pins: DSH 0.1.5's live `agent/assistant-stream` channel
+    /// emits every chunk of a turn under the SAME turn-level `session.seq`. The
+    /// client classified the second and later chunks as an `upsert`, and every
+    /// non-`append` patch took `kmpConversationStore.replace(...)` — a full
+    /// conversation rebuild plus an `associateBy(seq)` collapse, once per
+    /// streamed token. This drives real gateway-shaped frames through `AppStore`
+    /// and asserts the row-local path is taken and the fragments accumulate.
+    @MainActor
+    func testSameSequenceStreamChunksAccumulateRowLocallyWithoutRebaseline() async throws {
+        let session = SessionSummary(
+            id: "session-stream",
+            title: "Stream",
+            lastActivity: Date(timeIntervalSince1970: 100),
+            isRunning: true,
+            hasUnread: false
+        )
+        let store = AppStore(preferences: AppPreferencesSpy(
+            endpoint: "ws://127.0.0.1:3080/ws/mobile",
+            selectedWorkspaceID: nil,
+            sessions: [session]
+        ))
+        let prepared = await store.prepareConversation(for: session)
+        XCTAssertTrue(prepared)
+
+        func deliver(_ json: String) async throws {
+            store.gateway.onFrame?(try GatewayWireDecoder.decode(Data(json.utf8)))
+            await flushDeferredKMPEvents(in: store)
+        }
+
+        // The user's prompt is a durable event and takes the append path.
+        try await deliver(#"{"kind":"event","sessionId":"session-stream","seq":4,"time":100,"event":{"type":"user/message","text":"hi","source":"user"}}"#)
+        XCTAssertEqual(store.events[session.id]?.count, 1)
+
+        // Four chunks of ONE step, all at the turn watermark `seq` 5, exactly as
+        // the gateway forwards them from `agent/assistant-stream`. Measured
+        // against a real qualification host: 195 live chunks shared one seq, and
+        // the finalizing `assistant/message` carried that same seq.
+        //
+        // This mirror keeps one record per durable seq and each stream patch
+        // carries the new fragment, so the mirror holds the newest delta — that is
+        // the platform contract. The ACCUMULATED text lives in the KMP journal
+        // (asserted in SharedHistoryStoreTest) and in the projected row below.
+        for fragment in ["Hel", "lo", " there", "!"] {
+            try await deliver(
+                #"{"kind":"event","sessionId":"session-stream","seq":5,"time":101,"event":{"type":"assistant/chunk","turn":1,"step":1,"chunkType":"text-delta","text":"\#(fragment)"}}"#
+            )
+            XCTAssertEqual(store.events[session.id]?.last?.event.text, fragment)
+            XCTAssertNil(store.lastError)
+        }
+        XCTAssertEqual(store.events[session.id]?.count, 2)
+
+        // The streaming row accumulated every fragment rather than rebuilding
+        // from the last one.
+        await store.awaitConversationProjectionForTesting(
+            sessionID: session.id,
+            expectedText: "Hello there!"
+        )
+        XCTAssertEqual(
+            store.renderedConversationItems[session.id]?.last?.text,
+            "Hello there!"
+        )
+
+        // The authoritative finalization arrives at the SAME durable seq as its
+        // chunks on a real host (measured: max chunk seq 17 = final seq 17). That
+        // is exactly the record `receiveEvent` refuses as not strictly newer, so
+        // the same-seq route must carry it and apply the authoritative text.
+        try await deliver(#"{"kind":"event","sessionId":"session-stream","seq":5,"time":102,"event":{"type":"assistant/message","turn":1,"step":1,"text":"Hello there! (final)"}}"#)
+        await store.awaitConversationProjectionForTesting(
+            sessionID: session.id,
+            expectedText: "Hello there! (final)"
+        )
+        let finalized = try XCTUnwrap(store.renderedConversationItems[session.id]?.last)
+        XCTAssertEqual(finalized.text, "Hello there! (final)")
+        XCTAssertEqual(finalized.title, "DeepSeek")
+        XCTAssertEqual(store.events[session.id]?.last?.event.text, "Hello there! (final)")
+
+        // The rebuild-vs-fold distinction is asserted where it is observable —
+        // `SharedHistoryStoreTest` pins the patch classification and
+        // `QualificationWireReplayTest` pins the full-conversation rebuild count
+        // over real captured frames. Here the contract is the text itself.
+    }
+
+    /// `reasoning-delta` and `tool-call-delta` share the same turn watermark, so
+    /// they must take the same row-local route and merge into their own rows.
+    @MainActor
+    func testSameSequenceReasoningAndToolCallDeltasAccumulateRowLocally() async throws {
+        let session = SessionSummary(
+            id: "session-stream-2",
+            title: "Stream 2",
+            lastActivity: Date(timeIntervalSince1970: 100),
+            isRunning: true,
+            hasUnread: false
+        )
+        let store = AppStore(preferences: AppPreferencesSpy(
+            endpoint: "ws://127.0.0.1:3080/ws/mobile",
+            selectedWorkspaceID: nil,
+            sessions: [session]
+        ))
+        let prepared = await store.prepareConversation(for: session)
+        XCTAssertTrue(prepared)
+
+        func deliver(_ json: String) async throws {
+            store.gateway.onFrame?(try GatewayWireDecoder.decode(Data(json.utf8)))
+            await flushDeferredKMPEvents(in: store)
+        }
+
+        var reasoningText = ""
+        for fragment in ["Let me ", "think ", "about it"] {
+            reasoningText += fragment
+            try await deliver(
+                #"{"kind":"event","sessionId":"session-stream-2","seq":7,"time":101,"event":{"type":"assistant/chunk","turn":1,"step":1,"chunkType":"reasoning-delta","text":"\#(fragment)"}}"#
+            )
+            XCTAssertEqual(store.events[session.id]?.last?.event.text, fragment)
+        }
+        await store.awaitConversationProjectionForTesting(
+            sessionID: session.id,
+            expectedText: reasoningText
+        )
+        let reasoningRow = try XCTUnwrap(
+            store.renderedConversationItems[session.id]?.last { $0.kind == .reasoning },
+            "reasoning row missing from \(store.renderedConversationItems[session.id]?.map(\.kind) ?? [])"
+        )
+        XCTAssertEqual(reasoningRow.text, reasoningText)
+
+        // Real tool-argument deltas are pieces of a JSON document, so the
+        // fragments themselves contain quotes. They must be JSON-escaped before
+        // being spliced into the frame, or the frame stops being valid JSON.
+        var arguments = ""
+        for fragment in ["{\"path\"", ":\"a.txt\"", "}"] {
+            arguments += fragment
+            let escaped = fragment
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            try await deliver(
+                #"{"kind":"event","sessionId":"session-stream-2","seq":8,"time":102,"event":{"type":"assistant/chunk","turn":1,"step":1,"chunkType":"tool-call-delta","tool":{"id":"call-1","name":"read_file","argumentsDelta":"\#(escaped)"}}}"#
+            )
+        }
+        await store.awaitConversationProjectionForTesting(
+            sessionID: session.id,
+            expectedText: arguments
+        )
+        // A plain tool name projects as a tool row (`run_code` would be a
+        // `jsonTool` row by design).
+        let toolRow = try XCTUnwrap(
+            store.renderedConversationItems[session.id]?.last { $0.kind == .tool },
+            "tool row missing from \(store.renderedConversationItems[session.id]?.map(\.kind) ?? [])"
+        )
+        XCTAssertEqual(toolRow.text, arguments)
+
+    }
+
     @MainActor
     func testKMPConversationAdapterConsumesIncrementalPushEvents() throws {
         let adapter = KMPConversationStoreAdapter()
@@ -5848,6 +5999,18 @@ private final class MalformedConversationEventBridge:
             errorCode: "unsupported", errorMessage: nil
         )
     }
+
+    /// Fault injection lives on the shared event path: this bridge is only here
+    /// to prove a malformed patch fails the adapter closed, so the stream-delta
+    /// and presence probes report "unsupported" rather than pretending to work.
+    func receiveStreamDelta(eventJson: String) -> SharedMviDispatchResult {
+        SharedMviDispatchResult(
+            accepted: false, transactionId: nil, eventSequence: nil,
+            errorCode: "unsupported", errorMessage: nil
+        )
+    }
+
+    func hasProjection(sessionId: String) -> Bool { false }
 
     func clearSession(sessionId: String) -> SharedMviDispatchResult {
         SharedMviDispatchResult(

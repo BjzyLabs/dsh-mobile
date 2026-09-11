@@ -88,6 +88,8 @@ enum KMPConversationStoreError: LocalizedError, Equatable {
 
 protocol KMPConversationStoreBridging: AnyObject {
     func receiveEvent(eventJson: String) -> SharedMviDispatchResult
+    func receiveStreamDelta(eventJson: String) -> SharedMviDispatchResult
+    func hasProjection(sessionId: String) -> Bool
     func replaceSession(sessionId: String, eventsJson: String) -> SharedMviDispatchResult
     func clearSession(sessionId: String) -> SharedMviDispatchResult
 }
@@ -183,6 +185,22 @@ final class KMPConversationStoreAdapter {
         try dispatch(.event(sessionID: event.sessionId, sequence: event.seq)) {
             store.receiveEvent(eventJson: try encode(event))
         }
+    }
+
+    /// Streaming chunk that shares its `session.seq` with the rest of its turn.
+    /// The store mutates only the affected row, so this must never fall back to
+    /// `replace`: a rebaseline here is the once-per-token whole-history rebuild.
+    func receiveStreamDelta(_ event: SessionEvent) throws {
+        let json = try encode(event)
+        try dispatch(.event(sessionID: event.sessionId, sequence: event.seq)) {
+            store.receiveStreamDelta(eventJson: json)
+        }
+    }
+
+    /// Whether a projection baseline exists for the session. Without one there
+    /// is no row to mutate, so the platform must rebaseline instead.
+    func hasProjection(sessionID: String) -> Bool {
+        store.hasProjection(sessionId: sessionID)
     }
 
     func replace(sessionID: String, events: [SessionEvent]) throws {
@@ -1264,6 +1282,28 @@ final class KMPHistoryStoreAdapter {
                   Set(records.map(\.seq)).count == records.count else {
                 throw KMPHistoryStoreError.invalidEvent("upsert 后事件顺序无效")
             }
+        case "stream":
+            // Same-sequence streaming chunk. The record supersedes the entry at
+            // its own index, so the sequence order provably cannot change — which
+            // is why this case deliberately omits the two `records.map`
+            // allocations, the sort and the `Set` build that `upsert` performs to
+            // re-prove order. Those ran once per streamed token.
+            guard case .live(let expectedSession, let expectedSequence) = intent,
+                  expectedSession == sessionID,
+                  let record = patch.record,
+                  record.sessionId == sessionID,
+                  record.seq == expectedSequence,
+                  let index = patch.index,
+                  records.indices.contains(index),
+                  records[index].seq == record.seq,
+                  record.event.type == "assistant/chunk",
+                  patch.replacementEvents == nil else {
+                throw KMPHistoryStoreError.invalidEvent("stream event patch 无效")
+            }
+            // The KMP store already merged this delta into the record at `index`
+            // and published the accumulated result, so this mirror stores it
+            // verbatim. Merging again here would concatenate the fragment twice.
+            records[index] = record
         case "replace":
             guard isPageOrClear(intent),
                   patch.record == nil,
