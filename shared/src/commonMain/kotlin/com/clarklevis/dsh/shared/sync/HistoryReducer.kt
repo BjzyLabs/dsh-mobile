@@ -199,7 +199,24 @@ object HistoryReducer {
     private fun unchanged(state: HistoryState) = HistoryReduction(state, HistoryResult.None)
 }
 
-data class HistoryEventMergeResult(val events: List<SessionEvent>, val replacedOrInsertedOutOfOrder: Boolean)
+/**
+ * [replacedOrInsertedOutOfOrder] is true when the merged list is not a plain
+ * append. It deliberately does NOT say *why*, so callers that need to
+ * distinguish a same-sequence supersede from a gap fill must read
+ * [replacedSameSequence].
+ *
+ * [replacedSameSequence] means the record landed on a `seq` that already existed
+ * and took its place. DSH's `session.seq` is a **turn-level** journal watermark:
+ * every `assistant/chunk` of a turn shares the same seq, so this is the ordinary
+ * shape of a streaming delta, not an out-of-order or duplicate delivery. When it
+ * is false the record was inserted at a position it did not occupy, which is a
+ * genuine structural change to the journal.
+ */
+data class HistoryEventMergeResult(
+    val events: List<SessionEvent>,
+    val replacedOrInsertedOutOfOrder: Boolean,
+    val replacedSameSequence: Boolean = false
+)
 
 object HistoryEventMerger {
     fun merge(record: SessionEvent, events: List<SessionEvent>): HistoryEventMergeResult {
@@ -212,8 +229,47 @@ object HistoryEventMerger {
             val middle = (low + high) / 2
             if (events[middle].seq < record.seq) low = middle + 1 else high = middle
         }
+        val replacedSameSequence = low < events.size && events[low].seq == record.seq
+        if (!replacedSameSequence) {
+            val result = events.toMutableList()
+            result.add(low, record)
+            return HistoryEventMergeResult(result, true, false)
+        }
         val result = events.toMutableList()
-        if (low < result.size && result[low].seq == record.seq) result[low] = record else result.add(low, record)
-        return HistoryEventMergeResult(result, true)
+        // A same-sequence assistant chunk continues the step that already owns
+        // this watermark, so its payload has to MERGE into the retained record.
+        // Overwriting is what lost the intermediate fragments: the list kept only
+        // the newest delta, every rebaseline projected just that fragment, and the
+        // reply appeared to arrive one word at a time.
+        result[low] = foldStreamChunk(events[low], record)
+        return HistoryEventMergeResult(result, true, true)
+    }
+
+    /**
+     * Merge [record] into the same-sequence [previous] when they are two chunks of
+     * the same step. Returns [record] unchanged for anything else — notably the
+     * authoritative `assistant/message`, a different event type, which must
+     * replace the accumulated fragments rather than extend them.
+     */
+    private fun foldStreamChunk(previous: SessionEvent, record: SessionEvent): SessionEvent {
+        val before = previous.event
+        val after = record.event
+        if (before.type != "assistant/chunk" || after.type != "assistant/chunk") return record
+        if (before.turn != after.turn || before.step != after.step) return record
+        if (before.chunkType == null || before.chunkType != after.chunkType) return record
+        val merged = when (after.chunkType) {
+            "text-delta", "reasoning-delta" ->
+                after.copy(text = before.text.orEmpty() + after.text.orEmpty())
+            "tool-call-delta" -> after.copy(
+                tool = after.tool?.let { delta ->
+                    delta.copy(argumentsDelta = previous.event.tool?.argumentsDelta.orEmpty() + delta.argumentsDelta.orEmpty())
+                }
+            )
+            // `usage`/`finish`/`block-*` and anything this client does not know
+            // carry no accumulable display payload, so the newest frame is the
+            // whole story. Unknown types are kept, never dropped.
+            else -> after
+        }
+        return record.copy(event = merged)
     }
 }
