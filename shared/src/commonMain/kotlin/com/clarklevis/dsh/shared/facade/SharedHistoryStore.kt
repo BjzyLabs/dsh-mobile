@@ -147,15 +147,6 @@ class SharedHistoryStore(
         val merged = HistoryEventMerger.merge(record, oldEvents)
         val index = merged.events.binarySearchBy(record.seq) { it.seq }
         check(index >= 0) { "merged event missing" }
-        // The retained journal holds the ACCUMULATED record for a same-sequence
-        // chunk: that is what a later history page or rebaseline has to replay,
-        // and merging there is what stops the intermediate fragments from being
-        // lost. The conversation lane is incremental — it appends the patch
-        // record to a row it already holds — so a stream patch must carry the new
-        // fragment only. Publishing the accumulated record there would append the
-        // whole prefix again on every chunk.
-        val streamed = merged.replacedSameSequence && record.event.type == "assistant/chunk"
-        val published = if (streamed) record else merged.events[index]
         val reduction = HistoryReducer.reduce(
             state,
             HistoryAction.LiveEventReceived(record.sessionId, record.time),
@@ -165,20 +156,8 @@ class SharedHistoryStore(
             state = reduction.state,
             eventsBySession = eventsBySession + (record.sessionId to merged.events),
             eventPatch = SharedHistoryEventPatch(
-                // `replacedSameSequence` means the record superseded its own seq.
-                // For an assistant chunk that is the ordinary streaming shape
-                // (one turn-level `session.seq`, many chunks), so the platform
-                // can mutate the affected row in place instead of rebaselining
-                // the whole projection once per token. A record inserted at a
-                // position it did not occupy is a gap fill, and every other
-                // event type (notably the authoritative `assistant/message`)
-                // keeps the rebaseline path.
-                kind = when {
-                    !merged.replacedOrInsertedOutOfOrder -> "append"
-                    streamed -> "stream"
-                    else -> "upsert"
-                },
-                record = published,
+                kind = if (merged.replacedOrInsertedOutOfOrder) "upsert" else "append",
+                record = record,
                 index = index
             ),
             result = reduction.result,
